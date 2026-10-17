@@ -1,7 +1,5 @@
 # Отчёт по практической №1 — вариант 3 (Q18 «Large Volume Customer»)
 
->
-
 ## 1. Вариант и масштаб
 
 
@@ -34,7 +32,7 @@ docker run -d --name lakehouse-minio -p 9000:9000 -p 9001:9001 -e MINIO_ROOT_USE
 # PostgreSQL используется для хранения служебной информации Lakekeeper:  
 docker run -d --name lakehouse-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 -v pg-data:/var/lib/postgresql/data postgres:17  
   
-# Использованная команда запуска Spark (из конфигурации работы):  
+# Миграции Lakekeeper (создают служебные таблицы в PostgreSQL):  
 docker run --rm -e "LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!" -e "LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@host.docker.internal:5432/postgres" -e "LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@host.docker.internal:5432/postgres" quay.io/lakekeeper/catalog:latest-main migrate  
   
 # Lakekeeper используется в качестве REST-каталога Apache Iceberg:  
@@ -45,7 +43,9 @@ docker run -d --name trino -p 8080:8080 -v "${PWD}\catalog:/etc/trino/catalog" t
 ```
 
 
-Для проверки состояния сервисов использовалась команда: docker ps
+Для проверки состояния сервисов использовалась команда `docker ps`.
+
+![docker ps](images/01_docker_ps.png)
 
 
 По результатам проверки все четыре основных контейнера находились в состоянии `running`.
@@ -142,21 +142,20 @@ docker run -d --name trino -p 8080:8080 -v "${PWD}\catalog:/etc/trino/catalog" t
 ```
 
  Мои действия:  
-1. Подключилась к Trino через DBeaver (Host: \`localhost\`, Port: \`8080\`, User: \`trino\`).  
-2. Выполнила \`SHOW CATALOGS\` - увидела каталоги \`bronze\`, \`silver\`, \`gold\`.  
-3. Выполнила \`SHOW TABLES FROM bronze.lakehouse\` - увидела таблицы \`customer\` и \`orders\` (слой Bronze).  
-4. Выполнила \`SELECT \* FROM bronze.lakehouse.customer LIMIT 10\` - увидела сырые данные.  
-5. Зашла в MinIO Console (\`http://localhost:9001\`) - Buckets - \`bronze\` - увидела папки \`customer\` и \`orders\` с файлами \`.parquet\`, что подтверждает физическое хранение данных в объектном хранилище.  
+1. Подключилась к Trino через DBeaver (Host: `localhost`, Port: `8080`, User: `trino`).  
+2. Выполнила `SHOW CATALOGS` - увидела каталоги `bronze`, `silver`, `gold`.  
+3. Выполнила `SHOW TABLES FROM bronze.lakehouse` - увидела таблицы `customer` и `orders` (слой Bronze).  
+4. Выполнила `SELECT * FROM bronze.lakehouse.customer LIMIT 10` - увидела сырые данные.  
+5. Зашла в MinIO Console (`http://localhost:9001`) - Buckets - `bronze` - увидела папки `customer` и `orders` с файлами `.parquet`, что подтверждает физическое хранение данных в объектном хранилище.  
 
 ## 7. Выводы
 
-Работа показала, что медальон переносит стоимость вычислений из момента запроса в момент загрузки: на сыром Bronze Q18 джойнит 6 001 215 строк `lineitem` с `orders` и `customer`, а Gold отдаёт готовую витрину из 57 строк размером 0,002392 МБ — повторные запросы к витрине на порядки дешевле.
+**Что сделано.** Локально развёрнут Lakehouse (MinIO + PostgreSQL + Lakekeeper + Trino, клиент DBeaver). Построены три слоя: Bronze (`customer`, `orders` из `tpch.sf1`), Silver (`customer_cleaned`, `orders_cleaned` — только нужные для Q18 колонки) и Gold (`q18_result`, 57 строк). Gold отдаёт готовый результат Q18 вместо повторного джойна трёх таблиц при каждом запросе.
 
-Эксперимент с кодеками на `lineitem` показал компромисс «размер ↔ скорость»: GZIP дал 148,27 МБ против 151,93 МБ у ZSTD (выигрыш 2,4 % по размеру), но разница во времени Q18 (6,078 / 5,269 с против 6,895 / 5,513 с) сопоставима с разбросом между первым и повторным запуском одного варианта (у ZSTD — 1,4 с). Отсюда методологический вывод: на sf1 надёжно сравнивать кодеки по размеру, а по времени — нет; для уверенного вывода по времени нужен sf3–sf5 или медиана из нескольких повторов. В пределах измеренного Parquet + ZSTD — разумный дефолт для Bronze и Silver, а для Gold кодек не важен из-за объёма в 57 строк.
+**Ограничение по `lineitem`.** Таблицу `lineitem` (≈6 млн строк) не удалось загрузить в Bronze: Lakekeeper вернул ошибку `Failed to create transaction`. Поэтому при построении Gold `lineitem` читался напрямую из `tpch.sf1`, а не из Bronze. Это отступление от схемы «сырые данные → Bronze → Silver → Gold»; повторная попытка загрузки частями описана в `sql/01b_bronze_lineitem_chunks.sql`.
 
-Проверка Iceberg подтвердила, ради чего выбирают lakehouse: `ALTER TABLE ... ADD COLUMN` добавил столбец в `bench.silver.schema_test` без перезаписи 10 строк, а `FOR VERSION AS OF` вернул предыдущую версию (10 строк) после того, как в текущей уже было 11, — оба механизма работают на уровне метаданных, не данных. Apache Spark 3.5.5 через тот же каталог Lakekeeper прочитал `bench.bronze.lineitem` за 3,41 с и получил те же 6 001 215 строк, что и Trino: данные в открытом формате в объектном хранилище не привязаны к конкретному движку.
+**Бенчмарк сжатия.** Сравнивались `orders_zstd` и `orders_gzip`. Размер получился одинаковым (35,9 МБ): Trino не применил GZIP, потому что я меняла параметр `compression_level`, а кодек выбирается параметром `compression_codec`. Значит, сравнить кодеки по размеру не получилось, а разницу во времени (10 с и 5,1 с) нельзя уверенно приписать кодеку: при одинаковых файлах она может объясняться кэшем, первым запуском или нагрузкой ноутбука. Поэтому утверждение «ZSTD быстрее GZIP» в этой работе не доказано; оно согласуется с теорией из лекции, но моими измерениями не подтверждено. Исправленный эксперимент — `sql/04_benchmark_orders.sql` и `bench/bench_orders.py`.
 
-Ограничение работы — масштаб sf1 и один узел Trino на ноутбуке: на этом объёме разница между кодеками по времени чтения на границе шума, а MinIO работает локально, поэтому ввод-вывод дешевле, чем в настоящем облачном хранилище. В облаке выигрыш GZIP по размеру (2,4 %) мог бы стать заметнее по деньгам, но это предположение, а не измеренный факт.
+**Iceberg.** `ALTER TABLE ... ADD COLUMN` добавил столбец без перезаписи файлов (схема хранится в метаданных, в старых строках значение `NULL`). Для Time Travel использован запрос `FOR VERSION AS OF <snapshot_id>`, который читает прежнее состояние таблицы.
 
-
- 
+**Ограничения.** Масштаб sf1, один узел Trino на ноутбуке, мало повторов замеров, локальный MinIO (ввод-вывод дешевле, чем в облаке). Поэтому выводы по времени предварительные; по размеру файлов они надёжнее, но только после корректного применения кодека.
